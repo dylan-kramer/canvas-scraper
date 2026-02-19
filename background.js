@@ -348,8 +348,9 @@ async function startDownload(courses, user) {
     // Phase 3: Generate ZIP
     updateState({ phase: 'zipping', progress: 0.8, progressText: 'Generating ZIP...' });
     
-    const zipBlob = await zip.generateAsync({
-      type: 'blob',
+    // Generate ZIP as base64 (service workers don't have URL.createObjectURL)
+    const zipBase64 = await zip.generateAsync({
+      type: 'base64',
       compression: 'DEFLATE',
       compressionOptions: { level: 6 }
     }, (metadata) => {
@@ -359,8 +360,8 @@ async function startDownload(courses, user) {
       });
     });
     
-    // Download the ZIP
-    const zipUrl = URL.createObjectURL(zipBlob);
+    // Download the ZIP using data URL
+    const zipUrl = `data:application/zip;base64,${zipBase64}`;
     const timestamp = new Date().toISOString().slice(0, 10);
     const zipName = courses.length === 1
       ? `${sanitizeFilename(courses[0].name)}_${timestamp}.zip`

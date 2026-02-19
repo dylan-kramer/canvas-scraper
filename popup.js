@@ -5,6 +5,7 @@ const API_BASE = `${CANVAS_BASE}/api/v1`;
 
 let currentUser = null;
 let courses = [];
+let selectedCourses = [];
 
 async function apiGet(endpoint) {
   const response = await fetch(`${API_BASE}${endpoint}`, { credentials: 'include' });
@@ -44,23 +45,46 @@ function setProgress(percent, text) {
   document.getElementById('progress-text').textContent = text;
 }
 
+function formatSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
 function updateUI(state) {
   const isRunning = state.running;
   const isDone = state.phase === 'done';
   const isError = state.phase === 'error';
   const isCancelled = state.phase === 'cancelled';
+  const isConfirming = state.phase === 'confirming';
   
-  // Show/hide buttons
-  document.getElementById('download-btn').style.display = isRunning ? 'none' : 'block';
+  // Show/hide buttons based on state
+  document.getElementById('scan-btn').style.display = (isRunning || isConfirming) ? 'none' : 'block';
+  document.getElementById('confirm-btn').style.display = isConfirming ? 'block' : 'none';
   document.getElementById('stop-btn').style.display = isRunning ? 'block' : 'none';
+  document.getElementById('cancel-btn').style.display = isConfirming ? 'block' : 'none';
+  
+  // Show/hide size estimate
+  const sizeEstimate = document.getElementById('size-estimate');
+  if (isConfirming) {
+    const sizeText = formatSize(state.estimatedSize);
+    sizeEstimate.innerHTML = `<strong>${state.totalFiles} files</strong> (~${sizeText})`;
+    sizeEstimate.style.display = 'block';
+  } else {
+    sizeEstimate.style.display = 'none';
+  }
+  
+  // Show/hide progress
   document.getElementById('progress').style.display = (isRunning || isDone || isError || isCancelled) ? 'block' : 'none';
   
-  // Disable course selection while running
+  // Disable course selection while running or confirming
   document.querySelectorAll('#course-list input').forEach(cb => {
-    cb.disabled = isRunning;
+    cb.disabled = isRunning || isConfirming;
   });
   const toggleAll = document.getElementById('toggle-all');
-  if (toggleAll) toggleAll.disabled = isRunning;
+  if (toggleAll) toggleAll.disabled = isRunning || isConfirming;
   
   // Update progress
   setProgress(state.progress * 100, state.progressText || '');
@@ -72,8 +96,10 @@ function updateUI(state) {
     setStatus(`Downloaded ${state.downloadedFiles} files${state.failedFiles > 0 ? ` (${state.failedFiles} failed)` : ''}`, 'success');
   } else if (isCancelled) {
     setStatus('Download cancelled', 'error');
+  } else if (isConfirming) {
+    setStatus('Ready to download. Click Confirm to proceed.', 'success');
   } else if (isRunning) {
-    setStatus('Downloading... (you can close this popup)', 'success');
+    setStatus('Processing... (you can close this popup)', 'success');
   }
 }
 
@@ -97,11 +123,28 @@ async function getBackgroundState() {
   });
 }
 
-function startDownload(selectedCourses) {
+function startScan() {
+  const selectedIds = Array.from(document.querySelectorAll('#course-list input:checked'))
+    .map(cb => parseInt(cb.value));
+  
+  selectedCourses = courses.filter(c => selectedIds.includes(c.id));
+  
+  if (selectedCourses.length === 0) {
+    setStatus('Select at least one course', 'error');
+    return;
+  }
+  
   chrome.runtime.sendMessage({
-    action: 'start',
+    action: 'scan',
     courses: selectedCourses,
     user: currentUser
+  });
+}
+
+function confirmDownload() {
+  chrome.runtime.sendMessage({
+    action: 'confirmDownload',
+    courses: selectedCourses
   });
 }
 
@@ -128,10 +171,14 @@ async function main() {
     // Get current background state
     const state = await getBackgroundState();
     
-    // If already running, just show progress
-    if (state.running) {
+    // If already running or confirming, just show progress
+    if (state.running || state.phase === 'confirming') {
+      // Load stored courses for confirm action
+      const stored = await chrome.storage.local.get('pendingCourses');
+      if (stored.pendingCourses) {
+        selectedCourses = stored.pendingCourses;
+      }
       updateUI(state);
-      // Still load courses in background
     }
     
     // Get user
@@ -165,25 +212,17 @@ async function main() {
       });
     });
     
-    // Download button
-    document.getElementById('download-btn').addEventListener('click', () => {
-      const selectedIds = Array.from(document.querySelectorAll('#course-list input:checked'))
-        .map(cb => parseInt(cb.value));
-      
-      const selectedCourses = courses.filter(c => selectedIds.includes(c.id));
-      
-      if (selectedCourses.length === 0) {
-        setStatus('Select at least one course', 'error');
-        return;
-      }
-      
-      startDownload(selectedCourses);
-    });
+    // Scan button (renamed from download)
+    document.getElementById('scan-btn').addEventListener('click', startScan);
+    
+    // Confirm button (new)
+    document.getElementById('confirm-btn').addEventListener('click', confirmDownload);
     
     // Stop button
-    document.getElementById('stop-btn').addEventListener('click', () => {
-      stopDownload();
-    });
+    document.getElementById('stop-btn').addEventListener('click', stopDownload);
+    
+    // Cancel button (for confirming state)
+    document.getElementById('cancel-btn').addEventListener('click', stopDownload);
     
     // Update UI with current state
     updateUI(state);

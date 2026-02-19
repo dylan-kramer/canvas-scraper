@@ -49,6 +49,13 @@
       background: #ccc;
       cursor: not-allowed;
     }
+    button.confirm {
+      background: #28a745;
+      color: white;
+    }
+    button.confirm:hover {
+      background: #218838;
+    }
     button.secondary {
       background: #eee;
       color: #333;
@@ -100,6 +107,19 @@
       color: #666;
       margin-bottom: 8px;
     }
+    .size-estimate {
+      background: #e3f2fd;
+      border: 1px solid #90caf9;
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 12px;
+      text-align: center;
+      font-size: 14px;
+      color: #1565c0;
+    }
+    .size-estimate strong {
+      font-size: 16px;
+    }
   </style>
 </head>
 <body>
@@ -115,11 +135,19 @@
     </div>
     <div id="course-list" class="course-list"></div>
     
-    <button id="download-btn" class="primary">
-      Download Selected Courses
+    <div id="size-estimate" class="size-estimate" style="display: none;"></div>
+    
+    <button id="scan-btn" class="primary">
+      Scan Selected Courses
+    </button>
+    <button id="confirm-btn" class="confirm" style="display: none;">
+      ✓ Confirm Download
     </button>
     <button id="stop-btn" class="secondary" style="display: none;">
       ⬛ Stop Download
+    </button>
+    <button id="cancel-btn" class="secondary" style="display: none;">
+      ✕ Cancel
     </button>
   </div>
 

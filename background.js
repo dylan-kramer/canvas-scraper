@@ -5,16 +5,19 @@ importScripts('jszip.min.js');
 
 const CANVAS_BASE = 'https://canvas.unl.edu';
 const API_BASE = `${CANVAS_BASE}/api/v1`;
+const CONCURRENT_DOWNLOADS = 4;
 
 let downloadState = {
   running: false,
-  phase: 'idle', // idle, scanning, downloading, zipping, done, error, cancelled
+  phase: 'idle', // idle, scanning, confirming, downloading, zipping, done, error, cancelled
   progress: 0,
   progressText: '',
   totalFiles: 0,
   downloadedFiles: 0,
   failedFiles: 0,
-  error: null
+  estimatedSize: 0,
+  error: null,
+  pendingDownloads: null // Holds downloads awaiting confirmation
 };
 
 let abortController = null;
@@ -167,6 +170,120 @@ async function processModule(courseId, courseName, mod, signal) {
   return moduleDownloads;
 }
 
+// NEW: Collect discussion attachments
+async function collectDiscussions(courseId, courseName, signal) {
+  const downloads = [];
+  
+  try {
+    const topics = await apiGetAll(`/courses/${courseId}/discussion_topics?per_page=50`, signal);
+    
+    for (const topic of topics) {
+      const topicName = sanitizeFilename(topic.title || 'Untitled');
+      
+      // Attachments on the topic itself
+      if (topic.attachments) {
+        for (const att of topic.attachments) {
+          downloads.push({
+            url: att.url,
+            filename: `${courseName}/Discussions/${topicName}/${att.display_name}`,
+            size: att.size || 0
+          });
+        }
+      }
+      
+      // Get entries for this topic
+      try {
+        const entries = await apiGetAll(`/courses/${courseId}/discussion_topics/${topic.id}/entries?per_page=50`, signal);
+        for (const entry of entries) {
+          if (entry.attachment) {
+            downloads.push({
+              url: entry.attachment.url,
+              filename: `${courseName}/Discussions/${topicName}/${entry.attachment.display_name}`,
+              size: entry.attachment.size || 0
+            });
+          }
+          // Check replies too
+          if (entry.recent_replies) {
+            for (const reply of entry.recent_replies) {
+              if (reply.attachment) {
+                downloads.push({
+                  url: reply.attachment.url,
+                  filename: `${courseName}/Discussions/${topicName}/${reply.attachment.display_name}`,
+                  size: reply.attachment.size || 0
+                });
+              }
+            }
+          }
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        // 403 on entries is common, skip
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    // Discussions not accessible, skip
+  }
+  
+  return downloads;
+}
+
+// NEW: Collect announcements (as HTML files + attachments)
+async function collectAnnouncements(courseId, courseName, signal) {
+  const downloads = [];
+  
+  try {
+    const announcements = await apiGetAll(`/courses/${courseId}/discussion_topics?only_announcements=true&per_page=50`, signal);
+    
+    for (const ann of announcements) {
+      const annTitle = sanitizeFilename(ann.title || 'Untitled');
+      
+      // Save announcement content as HTML
+      const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>${ann.title || 'Announcement'}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+    h1 { color: #333; }
+    .meta { color: #666; font-size: 14px; margin-bottom: 20px; }
+    .content { line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>${ann.title || 'Announcement'}</h1>
+  <div class="meta">Posted: ${ann.posted_at || ann.created_at || 'Unknown'}</div>
+  <div class="content">${ann.message || ''}</div>
+</body>
+</html>`;
+      
+      downloads.push({
+        content: htmlContent,
+        filename: `${courseName}/Announcements/${annTitle}.html`,
+        size: htmlContent.length,
+        isText: true
+      });
+      
+      // Attachments on the announcement
+      if (ann.attachments) {
+        for (const att of ann.attachments) {
+          downloads.push({
+            url: att.url,
+            filename: `${courseName}/Announcements/${annTitle}/${att.display_name}`,
+            size: att.size || 0
+          });
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    // Announcements not accessible, skip
+  }
+  
+  return downloads;
+}
+
 async function collectDownloads(course, user, signal, onProgress) {
   const courseName = sanitizeFilename(course.name);
   const downloads = [];
@@ -189,29 +306,29 @@ async function collectDownloads(course, user, signal, onProgress) {
       } catch (e) {
         if (e.name === 'AbortError') throw e;
       }
-      onProgress((i + 1) / folders.length * 0.2, `${courseName}: Scanned ${i + 1}/${folders.length} folders`);
+      onProgress((i + 1) / folders.length * 0.15, `${courseName}: Scanned ${i + 1}/${folders.length} folders`);
     }
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    onProgress(0.2, `${courseName}: Files tab not accessible`);
+    onProgress(0.15, `${courseName}: Files tab not accessible`);
   }
   
   // Modules
-  onProgress(0.2, `${courseName}: Scanning modules...`);
+  onProgress(0.15, `${courseName}: Scanning modules...`);
   try {
     const modules = await apiGetAll(`/courses/${course.id}/modules?include[]=items&per_page=50`, signal);
     for (let i = 0; i < modules.length; i++) {
       const mod = modules[i];
       const moduleFiles = await processModule(course.id, courseName, mod, signal);
       downloads.push(...moduleFiles);
-      onProgress(0.2 + (i + 1) / modules.length * 0.4, `${courseName}: Scanned module ${mod.name}`);
+      onProgress(0.15 + (i + 1) / modules.length * 0.25, `${courseName}: Scanned module ${mod.name}`);
     }
   } catch (e) {
     if (e.name === 'AbortError') throw e;
   }
   
   // Assignments
-  onProgress(0.6, `${courseName}: Scanning assignments...`);
+  onProgress(0.4, `${courseName}: Scanning assignments...`);
   try {
     const assignments = await apiGetAll(`/courses/${course.id}/assignments?per_page=50`, signal);
     for (let i = 0; i < assignments.length; i++) {
@@ -252,11 +369,23 @@ async function collectDownloads(course, user, signal, onProgress) {
         if (e.name === 'AbortError') throw e;
       }
       
-      onProgress(0.6 + (i + 1) / assignments.length * 0.4, `${courseName}: Scanned ${i + 1}/${assignments.length} assignments`);
+      onProgress(0.4 + (i + 1) / assignments.length * 0.25, `${courseName}: Scanned ${i + 1}/${assignments.length} assignments`);
     }
   } catch (e) {
     if (e.name === 'AbortError') throw e;
   }
+  
+  // NEW: Discussions
+  onProgress(0.65, `${courseName}: Scanning discussions...`);
+  const discussionDownloads = await collectDiscussions(course.id, courseName, signal);
+  downloads.push(...discussionDownloads);
+  
+  // NEW: Announcements
+  onProgress(0.8, `${courseName}: Scanning announcements...`);
+  const announcementDownloads = await collectAnnouncements(course.id, courseName, signal);
+  downloads.push(...announcementDownloads);
+  
+  onProgress(1, `${courseName}: Scan complete`);
   
   return downloads;
 }
@@ -267,7 +396,56 @@ async function fetchFileAsBlob(url, signal) {
   return await response.blob();
 }
 
-async function startDownload(courses, user) {
+// NEW: Concurrent download pool
+async function downloadWithConcurrency(downloads, zip, signal, onProgress) {
+  let completed = 0;
+  let failed = 0;
+  const total = downloads.length;
+  
+  // Create a queue of work
+  const queue = [...downloads];
+  const workers = [];
+  
+  async function worker() {
+    while (queue.length > 0) {
+      signal.throwIfAborted();
+      
+      const dl = queue.shift();
+      if (!dl) break;
+      
+      const shortName = dl.filename.split('/').pop();
+      
+      try {
+        if (dl.isText) {
+          // Text content (like announcements HTML)
+          zip.file(dl.filename, dl.content);
+        } else {
+          // File download
+          const blob = await fetchFileAsBlob(dl.url, signal);
+          zip.file(dl.filename, blob);
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        failed++;
+      }
+      
+      completed++;
+      onProgress(completed, failed, total, shortName);
+    }
+  }
+  
+  // Start workers
+  for (let i = 0; i < CONCURRENT_DOWNLOADS; i++) {
+    workers.push(worker());
+  }
+  
+  // Wait for all workers to finish
+  await Promise.all(workers);
+  
+  return { completed, failed };
+}
+
+async function scanOnly(courses, user) {
   if (downloadState.running) return;
   
   abortController = new AbortController();
@@ -277,11 +455,13 @@ async function startDownload(courses, user) {
     running: true,
     phase: 'scanning',
     progress: 0,
-    progressText: 'Starting...',
+    progressText: 'Starting scan...',
     totalFiles: 0,
     downloadedFiles: 0,
     failedFiles: 0,
-    error: null
+    estimatedSize: 0,
+    error: null,
+    pendingDownloads: null
   });
   
   try {
@@ -290,7 +470,7 @@ async function startDownload(courses, user) {
     for (let i = 0; i < courses.length; i++) {
       const course = courses[i];
       const courseDownloads = await collectDownloads(course, user, signal, (p, text) => {
-        const overallProgress = (i + p) / courses.length * 0.3;
+        const overallProgress = (i + p) / courses.length;
         updateState({ progress: overallProgress, progressText: text });
       });
       allDownloads = allDownloads.concat(courseDownloads);
@@ -309,39 +489,77 @@ async function startDownload(courses, user) {
       return;
     }
     
+    // Calculate total size
+    const totalSize = allDownloads.reduce((sum, d) => sum + (d.size || 0), 0);
+    
+    // Store downloads and wait for confirmation
     updateState({
-      phase: 'downloading',
+      running: false,
+      phase: 'confirming',
       totalFiles: allDownloads.length,
-      progressText: `Downloading 0/${allDownloads.length}...`
+      estimatedSize: totalSize,
+      progressText: `Found ${allDownloads.length} files`,
+      pendingDownloads: allDownloads
     });
     
-    // Phase 2: Download files
-    const zip = new JSZip();
-    let downloaded = 0;
-    let failed = 0;
+    // Store for later use
+    chrome.storage.local.set({ 
+      pendingDownloads: allDownloads,
+      pendingCourses: courses 
+    });
     
-    for (const dl of allDownloads) {
-      signal.throwIfAborted();
-      
-      const shortName = dl.filename.split('/').pop();
-      updateState({
-        progress: 0.3 + (downloaded / allDownloads.length) * 0.5,
-        progressText: `Downloading ${downloaded + 1}/${allDownloads.length}: ${shortName}`,
-        downloadedFiles: downloaded,
-        failedFiles: failed
-      });
-      
-      try {
-        const blob = await fetchFileAsBlob(dl.url, signal);
-        zip.file(dl.filename, blob);
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        failed++;
-      }
-      
-      downloaded++;
-      await new Promise(r => setTimeout(r, 50));
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      updateState({ running: false, phase: 'cancelled', progressText: 'Cancelled' });
+    } else {
+      console.error(e);
+      updateState({ running: false, phase: 'error', error: e.message });
     }
+  } finally {
+    abortController = null;
+  }
+}
+
+async function confirmDownload(courses) {
+  // Retrieve pending downloads from storage
+  const { pendingDownloads } = await chrome.storage.local.get('pendingDownloads');
+  
+  if (!pendingDownloads || pendingDownloads.length === 0) {
+    updateState({ running: false, phase: 'error', error: 'No pending downloads' });
+    return;
+  }
+  
+  abortController = new AbortController();
+  const signal = abortController.signal;
+  
+  updateState({
+    running: true,
+    phase: 'downloading',
+    progress: 0.3,
+    totalFiles: pendingDownloads.length,
+    downloadedFiles: 0,
+    failedFiles: 0,
+    progressText: `Downloading 0/${pendingDownloads.length}...`,
+    pendingDownloads: null
+  });
+  
+  try {
+    // Phase 2: Download files concurrently
+    const zip = new JSZip();
+    
+    const { completed, failed } = await downloadWithConcurrency(
+      pendingDownloads,
+      zip,
+      signal,
+      (done, failCount, total, currentFile) => {
+        updateState({
+          progress: 0.3 + (done / total) * 0.5,
+          progressText: `Downloading ${done}/${total}: ${currentFile}`,
+          downloadedFiles: done - failCount,
+          failedFiles: failCount
+        });
+      }
+    );
     
     signal.throwIfAborted();
     
@@ -369,12 +587,15 @@ async function startDownload(courses, user) {
     
     chrome.downloads.download({ url: zipUrl, filename: zipName, saveAs: false });
     
+    // Clear pending downloads
+    chrome.storage.local.remove(['pendingDownloads', 'pendingCourses']);
+    
     updateState({
       running: false,
       phase: 'done',
       progress: 1,
-      progressText: `Done! ${downloaded - failed} files downloaded`,
-      downloadedFiles: downloaded - failed,
+      progressText: `Done! ${completed - failed} files downloaded`,
+      downloadedFiles: completed - failed,
       failedFiles: failed
     });
     
@@ -394,6 +615,13 @@ function stopDownload() {
   if (abortController) {
     abortController.abort();
   }
+  // Clear pending downloads on cancel
+  chrome.storage.local.remove(['pendingDownloads', 'pendingCourses']);
+  updateState({ 
+    running: false, 
+    phase: 'cancelled', 
+    pendingDownloads: null 
+  });
 }
 
 // Message handler
@@ -403,8 +631,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   
-  if (message.action === 'start') {
-    startDownload(message.courses, message.user);
+  if (message.action === 'scan') {
+    scanOnly(message.courses, message.user);
+    sendResponse({ ok: true });
+    return true;
+  }
+  
+  if (message.action === 'confirmDownload') {
+    confirmDownload(message.courses);
     sendResponse({ ok: true });
     return true;
   }

@@ -4,7 +4,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'download') {
     chrome.downloads.download({
       url: message.url,
-      filename: `Canvas/${message.filename}`,
+      filename: message.filename,
       saveAs: false
     }, (downloadId) => {
       if (chrome.runtime.lastError) {
@@ -14,6 +14,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true, downloadId });
       }
     });
-    return true; // Keep channel open for async response
+    return true;
   }
 });

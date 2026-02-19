@@ -47,9 +47,8 @@ function setProgress(percent, text) {
 }
 
 async function getCourses() {
-  // Get all courses where we're a student or teacher
   const courses = await apiGetAll('/courses?enrollment_state=active&include[]=term&per_page=50');
-  return courses.filter(c => c.name); // Filter out access-denied courses
+  return courses.filter(c => c.name);
 }
 
 async function getCourseFiles(courseId) {
@@ -119,24 +118,50 @@ function buildFolderPath(folders, folderId) {
   return parts.join('/');
 }
 
-async function downloadFile(url, filename) {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      { action: 'download', url, filename },
-      (response) => resolve(response)
-    );
-  });
+// Progress tracking
+class ProgressTracker {
+  constructor() {
+    this.phases = [];
+    this.currentPhase = 0;
+    this.phaseProgress = 0;
+  }
+  
+  setPhases(phases) {
+    // phases: [{name, weight}]
+    this.phases = phases;
+    const totalWeight = phases.reduce((sum, p) => sum + p.weight, 0);
+    let cumulative = 0;
+    this.phases.forEach(p => {
+      p.start = cumulative / totalWeight;
+      p.end = (cumulative + p.weight) / totalWeight;
+      cumulative += p.weight;
+    });
+    this.currentPhase = 0;
+    this.phaseProgress = 0;
+  }
+  
+  setPhase(index) {
+    this.currentPhase = index;
+    this.phaseProgress = 0;
+  }
+  
+  update(progress, text) {
+    // progress: 0-1 within current phase
+    this.phaseProgress = progress;
+    const phase = this.phases[this.currentPhase];
+    const overall = phase.start + (phase.end - phase.start) * progress;
+    setProgress(Math.round(overall * 100), text);
+  }
 }
 
-async function downloadCourse(course, user, onProgress) {
+async function collectDownloads(course, user, onProgress) {
   const courseName = sanitizeFilename(course.name);
   const downloads = [];
   
-  // Get folders for path building
   const folders = await getCourseFolders(course.id);
   
-  // 1. Download files from Files section
-  onProgress(`${courseName}: Fetching files...`);
+  // Files
+  onProgress(0, `${courseName}: Scanning files...`);
   const files = await getCourseFiles(course.id);
   
   for (const file of files) {
@@ -144,11 +169,11 @@ async function downloadCourse(course, user, onProgress) {
     const path = folderPath 
       ? `${courseName}/Files/${folderPath}/${file.display_name}`
       : `${courseName}/Files/${file.display_name}`;
-    downloads.push({ url: file.url, filename: path });
+    downloads.push({ url: file.url, filename: path, size: file.size || 0 });
   }
   
-  // 2. Download from modules
-  onProgress(`${courseName}: Fetching modules...`);
+  // Modules
+  onProgress(0.33, `${courseName}: Scanning modules...`);
   const modules = await getCourseModules(course.id);
   
   for (const mod of modules) {
@@ -162,7 +187,8 @@ async function downloadCourse(course, user, onProgress) {
           if (fileData.url) {
             downloads.push({
               url: fileData.url,
-              filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`
+              filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`,
+              size: fileData.size || 0
             });
           }
         } catch (e) {
@@ -172,8 +198,8 @@ async function downloadCourse(course, user, onProgress) {
     }
   }
   
-  // 3. Download assignment submissions
-  onProgress(`${courseName}: Fetching assignments...`);
+  // Assignments
+  onProgress(0.66, `${courseName}: Scanning assignments...`);
   const assignments = await getCourseAssignments(course.id);
   
   for (const assignment of assignments) {
@@ -184,21 +210,27 @@ async function downloadCourse(course, user, onProgress) {
     for (const att of submission.attachments) {
       downloads.push({
         url: att.url,
-        filename: `${courseName}/Assignments/${assignmentName}/${att.display_name}`
+        filename: `${courseName}/Assignments/${assignmentName}/${att.display_name}`,
+        size: att.size || 0
       });
     }
   }
   
+  onProgress(1, `${courseName}: Found ${downloads.length} files`);
   return downloads;
+}
+
+async function fetchFileAsBlob(url) {
+  const response = await fetch(url, { credentials: 'include' });
+  if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
+  return await response.blob();
 }
 
 async function main() {
   try {
-    // Check if we can access Canvas API
     const user = await getCurrentUser();
     setStatus(`Connected as ${user.name}`, 'success');
     
-    // Get courses
     const courses = await getCourses();
     
     if (courses.length === 0) {
@@ -206,7 +238,6 @@ async function main() {
       return;
     }
     
-    // Render course list
     const listEl = document.getElementById('course-list');
     listEl.innerHTML = courses.map(c => `
       <div class="course-item">
@@ -217,14 +248,12 @@ async function main() {
     
     document.getElementById('course-section').style.display = 'block';
     
-    // Toggle all handler
     document.getElementById('toggle-all').addEventListener('change', (e) => {
       document.querySelectorAll('#course-list input').forEach(cb => {
         cb.checked = e.target.checked;
       });
     });
     
-    // Download handler
     document.getElementById('download-btn').addEventListener('click', async () => {
       const selectedIds = Array.from(document.querySelectorAll('#course-list input:checked'))
         .map(cb => parseInt(cb.value));
@@ -239,21 +268,25 @@ async function main() {
       document.getElementById('download-btn').disabled = true;
       document.getElementById('progress').style.display = 'block';
       
-      let allDownloads = [];
-      let completed = 0;
+      const tracker = new ProgressTracker();
       
-      // Collect all downloads
-      for (const course of selectedCourses) {
-        setProgress(
-          (completed / selectedCourses.length) * 50,
-          `Scanning ${course.name}...`
-        );
-        
-        const downloads = await downloadCourse(course, user, (msg) => {
-          document.getElementById('progress-text').textContent = msg;
+      // Phase 1: Scan (30%), Phase 2: Download & Zip (70%)
+      tracker.setPhases([
+        { name: 'scan', weight: 30 },
+        { name: 'download', weight: 70 }
+      ]);
+      
+      // Phase 1: Collect all downloads
+      tracker.setPhase(0);
+      let allDownloads = [];
+      
+      for (let i = 0; i < selectedCourses.length; i++) {
+        const course = selectedCourses[i];
+        const downloads = await collectDownloads(course, user, (p, text) => {
+          const courseProgress = (i + p) / selectedCourses.length;
+          tracker.update(courseProgress, text);
         });
         allDownloads = allDownloads.concat(downloads);
-        completed++;
       }
       
       // Deduplicate by URL
@@ -264,23 +297,72 @@ async function main() {
         return true;
       });
       
-      // Download files
-      let downloaded = 0;
-      for (const dl of allDownloads) {
-        setProgress(
-          50 + (downloaded / allDownloads.length) * 50,
-          `Downloading ${downloaded + 1}/${allDownloads.length}: ${dl.filename.split('/').pop()}`
-        );
-        
-        await downloadFile(dl.url, dl.filename);
-        downloaded++;
-        
-        // Small delay to avoid overwhelming
-        await new Promise(r => setTimeout(r, 100));
+      if (allDownloads.length === 0) {
+        setStatus('No files found in selected courses', 'error');
+        document.getElementById('download-btn').disabled = false;
+        return;
       }
       
-      setProgress(100, `Done! Downloaded ${downloaded} files.`);
-      setStatus(`Downloaded ${downloaded} files`, 'success');
+      // Phase 2: Download and add to zip
+      tracker.setPhase(1);
+      const zip = new JSZip();
+      let downloaded = 0;
+      let failed = 0;
+      const totalFiles = allDownloads.length;
+      
+      for (const dl of allDownloads) {
+        const shortName = dl.filename.split('/').slice(-1)[0];
+        tracker.update(
+          downloaded / totalFiles,
+          `Downloading ${downloaded + 1}/${totalFiles}: ${shortName}`
+        );
+        
+        try {
+          const blob = await fetchFileAsBlob(dl.url);
+          zip.file(dl.filename, blob);
+        } catch (e) {
+          console.warn(`Failed to download ${dl.filename}:`, e);
+          failed++;
+        }
+        
+        downloaded++;
+        
+        // Small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 50));
+      }
+      
+      // Generate zip
+      tracker.update(0.95, 'Generating ZIP file...');
+      
+      const zipBlob = await zip.generateAsync({ 
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 6 }
+      }, (metadata) => {
+        tracker.update(0.95 + (metadata.percent / 100) * 0.05, 
+          `Compressing: ${Math.round(metadata.percent)}%`);
+      });
+      
+      // Download zip
+      const zipUrl = URL.createObjectURL(zipBlob);
+      const timestamp = new Date().toISOString().slice(0, 10);
+      const zipName = selectedCourses.length === 1 
+        ? `${sanitizeFilename(selectedCourses[0].name)}_${timestamp}.zip`
+        : `Canvas_Courses_${timestamp}.zip`;
+      
+      chrome.runtime.sendMessage({
+        action: 'download',
+        url: zipUrl,
+        filename: zipName
+      });
+      
+      tracker.update(1, `Done! ${downloaded - failed} files in ZIP`);
+      setStatus(
+        failed > 0 
+          ? `Downloaded ${downloaded - failed} files (${failed} failed)` 
+          : `Downloaded ${downloaded} files`,
+        'success'
+      );
       document.getElementById('download-btn').disabled = false;
     });
     

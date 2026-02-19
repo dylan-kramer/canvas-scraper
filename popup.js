@@ -79,13 +79,8 @@ async function getFolderFiles(folderId, signal) {
 }
 
 async function getCourseFolders(courseId, signal) {
-  try {
-    return await apiGetAll(`/courses/${courseId}/folders?per_page=50`, signal);
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    console.warn(`Could not get folders for course ${courseId}:`, e);
-    return [];
-  }
+  // Let errors propagate - caller handles Files tab being disabled
+  return await apiGetAll(`/courses/${courseId}/folders?per_page=100`, signal);
 }
 
 async function getCourseModules(courseId, signal) {
@@ -178,49 +173,57 @@ async function collectDownloads(course, user, signal, onProgress) {
   const courseName = sanitizeFilename(course.name);
   const downloads = [];
   
-  // Get all folders first
-  const folders = await getCourseFolders(course.id, signal);
+  // === 1. FILES TAB (may be disabled by professor) ===
+  onProgress(0, `${courseName}: Scanning files...`);
   
-  // Build folder path map
-  const folderMap = {};
-  folders.forEach(f => folderMap[f.id] = f);
-  
-  function getFolderPath(folderId) {
-    const parts = [];
-    let current = folderMap[folderId];
-    while (current) {
-      // Skip root "course files" folder
-      if (current.name && current.name.toLowerCase() !== 'course files') {
-        parts.unshift(sanitizeFilename(current.name));
+  try {
+    const folders = await getCourseFolders(course.id, signal);
+    
+    if (folders.length > 0) {
+      // Build folder path map
+      const folderMap = {};
+      folders.forEach(f => folderMap[f.id] = f);
+      
+      function getFolderPath(folderId) {
+        const parts = [];
+        let current = folderMap[folderId];
+        while (current) {
+          if (current.name && current.name.toLowerCase() !== 'course files') {
+            parts.unshift(sanitizeFilename(current.name));
+          }
+          current = current.parent_folder_id ? folderMap[current.parent_folder_id] : null;
+        }
+        return parts.join('/');
       }
-      current = current.parent_folder_id ? folderMap[current.parent_folder_id] : null;
+      
+      for (let i = 0; i < folders.length; i++) {
+        const folder = folders[i];
+        const folderFiles = await getFolderFiles(folder.id, signal);
+        
+        for (const file of folderFiles) {
+          const folderPath = getFolderPath(file.folder_id);
+          const path = folderPath 
+            ? `${courseName}/Files/${folderPath}/${file.display_name}`
+            : `${courseName}/Files/${file.display_name}`;
+          downloads.push({ url: file.url, filename: path, size: file.size || 0 });
+        }
+        
+        onProgress((i + 1) / folders.length * 0.25, 
+          `${courseName}: Scanned ${i + 1}/${folders.length} folders (${downloads.length} files)`);
+      }
     }
-    return parts.join('/');
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    console.warn(`Files tab disabled or inaccessible for ${courseName}:`, e);
+    onProgress(0.25, `${courseName}: Files tab not accessible, continuing...`);
   }
   
-  // Fetch files from EACH folder (not just course-level endpoint)
-  onProgress(0, `${courseName}: Scanning ${folders.length} folders...`);
-  
-  for (let i = 0; i < folders.length; i++) {
-    const folder = folders[i];
-    const folderFiles = await getFolderFiles(folder.id, signal);
-    
-    for (const file of folderFiles) {
-      const folderPath = getFolderPath(file.folder_id);
-      const path = folderPath 
-        ? `${courseName}/Files/${folderPath}/${file.display_name}`
-        : `${courseName}/Files/${file.display_name}`;
-      downloads.push({ url: file.url, filename: path, size: file.size || 0 });
-    }
-    
-    // Update progress within file scanning phase
-    onProgress((i + 1) / folders.length * 0.3, `${courseName}: Scanned ${i + 1}/${folders.length} folders (${downloads.length} files)`);
-  }
-  
-  onProgress(0.33, `${courseName}: Scanning modules...`);
+  // === 2. MODULES (works even when Files is disabled) ===
+  onProgress(0.25, `${courseName}: Scanning modules...`);
   const modules = await getCourseModules(course.id, signal);
   
-  for (const mod of modules) {
+  for (let i = 0; i < modules.length; i++) {
+    const mod = modules[i];
     const moduleName = sanitizeFilename(mod.name);
     if (!mod.items) continue;
     
@@ -241,23 +244,44 @@ async function collectDownloads(course, user, signal, onProgress) {
         }
       }
     }
+    
+    onProgress(0.25 + (i + 1) / modules.length * 0.25,
+      `${courseName}: Scanned ${i + 1}/${modules.length} modules`);
   }
   
-  onProgress(0.66, `${courseName}: Scanning assignments...`);
+  // === 3. ASSIGNMENTS (both professor attachments AND your submissions) ===
+  onProgress(0.5, `${courseName}: Scanning assignments...`);
   const assignments = await getCourseAssignments(course.id, signal);
   
-  for (const assignment of assignments) {
-    const submission = await getSubmission(course.id, assignment.id, user.id, signal);
-    if (!submission || !submission.attachments) continue;
-    
+  for (let i = 0; i < assignments.length; i++) {
+    const assignment = assignments[i];
     const assignmentName = sanitizeFilename(assignment.name);
-    for (const att of submission.attachments) {
-      downloads.push({
-        url: att.url,
-        filename: `${courseName}/Assignments/${assignmentName}/${att.display_name}`,
-        size: att.size || 0
-      });
+    
+    // 3a. Professor's attachments TO the assignment
+    if (assignment.attachments && assignment.attachments.length > 0) {
+      for (const att of assignment.attachments) {
+        downloads.push({
+          url: att.url,
+          filename: `${courseName}/Assignments/${assignmentName}/Instructions/${att.display_name}`,
+          size: att.size || 0
+        });
+      }
     }
+    
+    // 3b. Your submission attachments
+    const submission = await getSubmission(course.id, assignment.id, user.id, signal);
+    if (submission && submission.attachments) {
+      for (const att of submission.attachments) {
+        downloads.push({
+          url: att.url,
+          filename: `${courseName}/Assignments/${assignmentName}/Submissions/${att.display_name}`,
+          size: att.size || 0
+        });
+      }
+    }
+    
+    onProgress(0.5 + (i + 1) / assignments.length * 0.5,
+      `${courseName}: Scanned ${i + 1}/${assignments.length} assignments`);
   }
   
   onProgress(1, `${courseName}: Found ${downloads.length} files`);

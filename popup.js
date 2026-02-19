@@ -152,11 +152,21 @@ function extractFileUrls(html, courseId) {
   return files;
 }
 
-async function getSubmission(courseId, assignmentId, userId, signal) {
+async function getSubmissionWithHistory(courseId, assignmentId, userId, signal) {
   try {
-    return await apiGet(`/courses/${courseId}/assignments/${assignmentId}/submissions/${userId}`, signal);
+    return await apiGet(`/courses/${courseId}/assignments/${assignmentId}/submissions/${userId}?include[]=submission_history`, signal);
   } catch (e) {
     if (e.name === 'AbortError') throw e;
+    return null;
+  }
+}
+
+async function getPageContent(courseId, pageUrl, signal) {
+  try {
+    return await apiGet(`/courses/${courseId}/pages/${pageUrl}`, signal);
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    console.warn(`Could not fetch page ${pageUrl}:`, e);
     return null;
   }
 }
@@ -267,75 +277,8 @@ async function collectDownloads(course, user, signal, onProgress) {
     onProgress(0.25, `${courseName}: Files tab not accessible, continuing...`);
   }
   
-  // === 2. HOME TAB (front page + announcements) ===
-  onProgress(0.2, `${courseName}: Scanning home page...`);
-  
-  try {
-    // Front page
-    const frontPage = await getCourseFrontPage(course.id, signal);
-    if (frontPage && frontPage.body) {
-      const fileIds = extractFileUrls(frontPage.body, course.id);
-      for (const fileId of fileIds) {
-        try {
-          const fileData = await apiGet(`/files/${fileId}`, signal);
-          if (fileData.url) {
-            downloads.push({
-              url: fileData.url,
-              filename: `${courseName}/Home/${fileData.display_name}`,
-              size: fileData.size || 0
-            });
-          }
-        } catch (e) {
-          if (e.name === 'AbortError') throw e;
-          console.warn('Could not fetch home page file:', e);
-        }
-      }
-    }
-    
-    // Announcements
-    onProgress(0.25, `${courseName}: Scanning announcements...`);
-    const announcements = await getCourseAnnouncements(course.id, signal);
-    
-    for (const ann of announcements) {
-      const annName = sanitizeFilename(ann.title || 'Untitled');
-      
-      // Attachments directly on the announcement
-      if (ann.attachments && ann.attachments.length > 0) {
-        for (const att of ann.attachments) {
-          downloads.push({
-            url: att.url,
-            filename: `${courseName}/Announcements/${annName}/${att.display_name}`,
-            size: att.size || 0
-          });
-        }
-      }
-      
-      // Files linked in announcement body
-      if (ann.message) {
-        const fileIds = extractFileUrls(ann.message, course.id);
-        for (const fileId of fileIds) {
-          try {
-            const fileData = await apiGet(`/files/${fileId}`, signal);
-            if (fileData.url) {
-              downloads.push({
-                url: fileData.url,
-                filename: `${courseName}/Announcements/${annName}/${fileData.display_name}`,
-                size: fileData.size || 0
-              });
-            }
-          } catch (e) {
-            if (e.name === 'AbortError') throw e;
-          }
-        }
-      }
-    }
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    console.warn(`Could not scan home/announcements for ${courseName}:`, e);
-  }
-  
-  // === 3. MODULES (works even when Files is disabled) ===
-  onProgress(0.35, `${courseName}: Scanning modules...`);
+  // === 2. MODULES (works even when Files is disabled) ===
+  onProgress(0.25, `${courseName}: Scanning modules...`);
   const modules = await getCourseModules(course.id, signal);
   
   for (let i = 0; i < modules.length; i++) {
@@ -344,6 +287,7 @@ async function collectDownloads(course, user, signal, onProgress) {
     if (!mod.items) continue;
     
     for (const item of mod.items) {
+      // Handle File items directly
       if (item.type === 'File' && item.url) {
         try {
           const fileData = await apiGet(item.url.replace(API_BASE, ''), signal);
@@ -359,13 +303,63 @@ async function collectDownloads(course, user, signal, onProgress) {
           console.warn('Could not fetch module file:', e);
         }
       }
+      
+      // Handle Page items - fetch page content and extract embedded file URLs
+      if (item.type === 'Page' && item.page_url) {
+        try {
+          const pageData = await getPageContent(course.id, item.page_url, signal);
+          if (pageData && pageData.body) {
+            const fileIds = extractFileUrls(pageData.body, course.id);
+            for (const fileId of fileIds) {
+              try {
+                const fileData = await apiGet(`/files/${fileId}`, signal);
+                if (fileData.url) {
+                  downloads.push({
+                    url: fileData.url,
+                    filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`,
+                    size: fileData.size || 0
+                  });
+                }
+              } catch (e) {
+                if (e.name === 'AbortError') throw e;
+                console.warn('Could not fetch file from page:', e);
+              }
+            }
+          }
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          console.warn('Could not fetch module page:', e);
+        }
+      }
+      
+      // Handle ExternalUrl items that link to files
+      if (item.type === 'ExternalUrl' && item.external_url) {
+        const url = item.external_url;
+        // Check if it's a Canvas file URL
+        const fileMatch = url.match(/\/files\/(\d+)/);
+        if (fileMatch) {
+          try {
+            const fileData = await apiGet(`/files/${fileMatch[1]}`, signal);
+            if (fileData.url) {
+              downloads.push({
+                url: fileData.url,
+                filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`,
+                size: fileData.size || 0
+              });
+            }
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            console.warn('Could not fetch external url file:', e);
+          }
+        }
+      }
     }
     
-    onProgress(0.35 + (i + 1) / modules.length * 0.2,
+    onProgress(0.25 + (i + 1) / modules.length * 0.3,
       `${courseName}: Scanned ${i + 1}/${modules.length} modules`);
   }
   
-  // === 4. ASSIGNMENTS (both professor attachments AND your submissions) ===
+  // === 3. ASSIGNMENTS (both professor attachments AND your submissions) ===
   onProgress(0.55, `${courseName}: Scanning assignments...`);
   const assignments = await getCourseAssignments(course.id, signal);
   
@@ -373,7 +367,7 @@ async function collectDownloads(course, user, signal, onProgress) {
     const assignment = assignments[i];
     const assignmentName = sanitizeFilename(assignment.name);
     
-    // 4a. Professor's attachments TO the assignment
+    // 3a. Professor's attachments TO the assignment
     if (assignment.attachments && assignment.attachments.length > 0) {
       for (const att of assignment.attachments) {
         downloads.push({
@@ -384,13 +378,31 @@ async function collectDownloads(course, user, signal, onProgress) {
       }
     }
     
-    // 4b. Your submission attachments
-    const submission = await getSubmission(course.id, assignment.id, user.id, signal);
-    if (submission && submission.attachments) {
+    // 3b. Your submission attachments - get ALL submission attempts
+    const submission = await getSubmissionWithHistory(course.id, assignment.id, user.id, signal);
+    if (submission && submission.submission_history && submission.submission_history.length > 0) {
+      // Process all submission attempts
+      for (let attemptIdx = 0; attemptIdx < submission.submission_history.length; attemptIdx++) {
+        const attempt = submission.submission_history[attemptIdx];
+        const attemptNum = attempt.attempt || (attemptIdx + 1);
+        const attemptFolder = `attempt_${attemptNum}`;
+        
+        if (attempt.attachments && attempt.attachments.length > 0) {
+          for (const att of attempt.attachments) {
+            downloads.push({
+              url: att.url,
+              filename: `${courseName}/Assignments/${assignmentName}/Submissions/${attemptFolder}/${att.display_name}`,
+              size: att.size || 0
+            });
+          }
+        }
+      }
+    } else if (submission && submission.attachments && submission.attachments.length > 0) {
+      // Fallback: if no submission_history, use current attachments
       for (const att of submission.attachments) {
         downloads.push({
           url: att.url,
-          filename: `${courseName}/Assignments/${assignmentName}/Submissions/${att.display_name}`,
+          filename: `${courseName}/Assignments/${assignmentName}/Submissions/attempt_1/${att.display_name}`,
           size: att.size || 0
         });
       }

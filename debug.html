@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Canvas Scraper Debug</title>
+  <style>
+    body { font-family: monospace; padding: 20px; max-width: 1200px; margin: 0 auto; }
+    pre { background: #f5f5f5; padding: 10px; overflow: auto; max-height: 400px; }
+    .course { margin: 20px 0; padding: 10px; border: 1px solid #ddd; }
+    h2 { margin: 0 0 10px 0; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+    .stats { background: #e8f5e9; padding: 10px; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h1>Canvas Scraper Debug</h1>
+  <p>Open this page while logged into Canvas to debug file fetching.</p>
+  <button id="run">Run Diagnostics</button>
+  <div id="output"></div>
+
+  <script>
+    const API_BASE = 'https://canvas.unl.edu/api/v1';
+    
+    async function apiGetAll(endpoint) {
+      let results = [];
+      let url = `${API_BASE}${endpoint}`;
+      let pages = 0;
+      
+      while (url) {
+        console.log('Fetching:', url);
+        const response = await fetch(url, { credentials: 'include' });
+        if (!response.ok) {
+          throw new Error(`API ${response.status}: ${await response.text()}`);
+        }
+        
+        const data = await response.json();
+        results = results.concat(data);
+        pages++;
+        
+        const link = response.headers.get('Link');
+        url = null;
+        if (link) {
+          const next = link.match(/<([^>]+)>;\s*rel="next"/);
+          if (next) url = next[1];
+        }
+      }
+      
+      console.log(`Got ${results.length} items in ${pages} pages`);
+      return results;
+    }
+    
+    async function apiGet(endpoint) {
+      const response = await fetch(`${API_BASE}${endpoint}`, { credentials: 'include' });
+      if (!response.ok) throw new Error(`API ${response.status}`);
+      return response.json();
+    }
+    
+    function log(html) {
+      document.getElementById('output').innerHTML += html;
+    }
+    
+    async function run() {
+      log('<p>Starting diagnostics...</p>');
+      
+      try {
+        // Get user
+        const user = await apiGet('/users/self');
+        log(`<p>✓ Logged in as: ${user.name}</p>`);
+        
+        // Get courses
+        const courses = await apiGetAll('/courses?enrollment_state=active&include[]=term&per_page=100');
+        const validCourses = courses.filter(c => c.name);
+        log(`<p>✓ Found ${validCourses.length} courses</p>`);
+        
+        // Check each course
+        for (const course of validCourses.slice(0, 5)) { // First 5 courses
+          log(`<div class="course"><h2>${course.name}</h2>`);
+          
+          try {
+            // Method 1: Direct files endpoint
+            const files = await apiGetAll(`/courses/${course.id}/files?per_page=100`);
+            log(`<p>Files endpoint: ${files.length} files</p>`);
+            
+            // Method 2: Get folders and count files per folder
+            const folders = await apiGetAll(`/courses/${course.id}/folders?per_page=100`);
+            log(`<p>Folders: ${folders.length}</p>`);
+            
+            let folderFileCount = 0;
+            for (const folder of folders) {
+              try {
+                const folderFiles = await apiGetAll(`/folders/${folder.id}/files?per_page=100`);
+                folderFileCount += folderFiles.length;
+                if (folderFiles.length > 0) {
+                  log(`<p>  - ${folder.full_name}: ${folderFiles.length} files</p>`);
+                }
+              } catch (e) {
+                log(`<p>  - ${folder.full_name}: ERROR - ${e.message}</p>`);
+              }
+            }
+            
+            log(`<div class="stats">
+              <strong>Summary:</strong><br>
+              /courses/{id}/files: ${files.length}<br>
+              Sum of /folders/{id}/files: ${folderFileCount}<br>
+              Difference: ${folderFileCount - files.length}
+            </div>`);
+            
+            if (files.length > 0) {
+              log(`<details><summary>Sample files from /courses/files</summary><pre>${JSON.stringify(files.slice(0, 5), null, 2)}</pre></details>`);
+            }
+            
+          } catch (e) {
+            log(`<p>Error: ${e.message}</p>`);
+          }
+          
+          log('</div>');
+        }
+        
+        log('<p>✓ Done!</p>');
+        
+      } catch (e) {
+        log(`<p style="color:red">Error: ${e.message}</p>`);
+        console.error(e);
+      }
+    }
+    
+    document.getElementById('run').onclick = run;
+  </script>
+</body>
+</html>

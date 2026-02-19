@@ -68,12 +68,12 @@ async function getCourses(signal) {
   return courses.filter(c => c.name);
 }
 
-async function getCourseFiles(courseId, signal) {
+async function getFolderFiles(folderId, signal) {
   try {
-    return await apiGetAll(`/courses/${courseId}/files?per_page=50`, signal);
+    return await apiGetAll(`/folders/${folderId}/files?per_page=100`, signal);
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    console.warn(`Could not get files for course ${courseId}:`, e);
+    console.warn(`Could not get files for folder ${folderId}:`, e);
     return [];
   }
 }
@@ -178,17 +178,43 @@ async function collectDownloads(course, user, signal, onProgress) {
   const courseName = sanitizeFilename(course.name);
   const downloads = [];
   
+  // Get all folders first
   const folders = await getCourseFolders(course.id, signal);
   
-  onProgress(0, `${courseName}: Scanning files...`);
-  const files = await getCourseFiles(course.id, signal);
+  // Build folder path map
+  const folderMap = {};
+  folders.forEach(f => folderMap[f.id] = f);
   
-  for (const file of files) {
-    const folderPath = buildFolderPath(folders, file.folder_id);
-    const path = folderPath 
-      ? `${courseName}/Files/${folderPath}/${file.display_name}`
-      : `${courseName}/Files/${file.display_name}`;
-    downloads.push({ url: file.url, filename: path, size: file.size || 0 });
+  function getFolderPath(folderId) {
+    const parts = [];
+    let current = folderMap[folderId];
+    while (current) {
+      // Skip root "course files" folder
+      if (current.name && current.name.toLowerCase() !== 'course files') {
+        parts.unshift(sanitizeFilename(current.name));
+      }
+      current = current.parent_folder_id ? folderMap[current.parent_folder_id] : null;
+    }
+    return parts.join('/');
+  }
+  
+  // Fetch files from EACH folder (not just course-level endpoint)
+  onProgress(0, `${courseName}: Scanning ${folders.length} folders...`);
+  
+  for (let i = 0; i < folders.length; i++) {
+    const folder = folders[i];
+    const folderFiles = await getFolderFiles(folder.id, signal);
+    
+    for (const file of folderFiles) {
+      const folderPath = getFolderPath(file.folder_id);
+      const path = folderPath 
+        ? `${courseName}/Files/${folderPath}/${file.display_name}`
+        : `${courseName}/Files/${file.display_name}`;
+      downloads.push({ url: file.url, filename: path, size: file.size || 0 });
+    }
+    
+    // Update progress within file scanning phase
+    onProgress((i + 1) / folders.length * 0.3, `${courseName}: Scanned ${i + 1}/${folders.length} folders (${downloads.length} files)`);
   }
   
   onProgress(0.33, `${courseName}: Scanning modules...`);

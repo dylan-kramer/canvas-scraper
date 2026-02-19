@@ -103,6 +103,55 @@ async function getCourseAssignments(courseId, signal) {
   }
 }
 
+async function getCourseFrontPage(courseId, signal) {
+  try {
+    return await apiGet(`/courses/${courseId}/front_page`, signal);
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    return null;
+  }
+}
+
+async function getCourseAnnouncements(courseId, signal) {
+  try {
+    return await apiGetAll(`/courses/${courseId}/discussion_topics?only_announcements=true&per_page=50`, signal);
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    console.warn(`Could not get announcements for course ${courseId}:`, e);
+    return [];
+  }
+}
+
+async function getDiscussionTopic(courseId, topicId, signal) {
+  try {
+    return await apiGet(`/courses/${courseId}/discussion_topics/${topicId}`, signal);
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    return null;
+  }
+}
+
+// Extract file URLs from HTML content (for pages/announcements)
+function extractFileUrls(html, courseId) {
+  if (!html) return [];
+  const files = [];
+  
+  // Match Canvas file URLs: /courses/123/files/456 or /files/456
+  const filePattern = /\/courses\/\d+\/files\/(\d+)|\/files\/(\d+)/g;
+  let match;
+  const seen = new Set();
+  
+  while ((match = filePattern.exec(html)) !== null) {
+    const fileId = match[1] || match[2];
+    if (!seen.has(fileId)) {
+      seen.add(fileId);
+      files.push(fileId);
+    }
+  }
+  
+  return files;
+}
+
 async function getSubmission(courseId, assignmentId, userId, signal) {
   try {
     return await apiGet(`/courses/${courseId}/assignments/${assignmentId}/submissions/${userId}`, signal);
@@ -218,8 +267,75 @@ async function collectDownloads(course, user, signal, onProgress) {
     onProgress(0.25, `${courseName}: Files tab not accessible, continuing...`);
   }
   
-  // === 2. MODULES (works even when Files is disabled) ===
-  onProgress(0.25, `${courseName}: Scanning modules...`);
+  // === 2. HOME TAB (front page + announcements) ===
+  onProgress(0.2, `${courseName}: Scanning home page...`);
+  
+  try {
+    // Front page
+    const frontPage = await getCourseFrontPage(course.id, signal);
+    if (frontPage && frontPage.body) {
+      const fileIds = extractFileUrls(frontPage.body, course.id);
+      for (const fileId of fileIds) {
+        try {
+          const fileData = await apiGet(`/files/${fileId}`, signal);
+          if (fileData.url) {
+            downloads.push({
+              url: fileData.url,
+              filename: `${courseName}/Home/${fileData.display_name}`,
+              size: fileData.size || 0
+            });
+          }
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          console.warn('Could not fetch home page file:', e);
+        }
+      }
+    }
+    
+    // Announcements
+    onProgress(0.25, `${courseName}: Scanning announcements...`);
+    const announcements = await getCourseAnnouncements(course.id, signal);
+    
+    for (const ann of announcements) {
+      const annName = sanitizeFilename(ann.title || 'Untitled');
+      
+      // Attachments directly on the announcement
+      if (ann.attachments && ann.attachments.length > 0) {
+        for (const att of ann.attachments) {
+          downloads.push({
+            url: att.url,
+            filename: `${courseName}/Announcements/${annName}/${att.display_name}`,
+            size: att.size || 0
+          });
+        }
+      }
+      
+      // Files linked in announcement body
+      if (ann.message) {
+        const fileIds = extractFileUrls(ann.message, course.id);
+        for (const fileId of fileIds) {
+          try {
+            const fileData = await apiGet(`/files/${fileId}`, signal);
+            if (fileData.url) {
+              downloads.push({
+                url: fileData.url,
+                filename: `${courseName}/Announcements/${annName}/${fileData.display_name}`,
+                size: fileData.size || 0
+              });
+            }
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    console.warn(`Could not scan home/announcements for ${courseName}:`, e);
+  }
+  
+  // === 3. MODULES (works even when Files is disabled) ===
+  onProgress(0.35, `${courseName}: Scanning modules...`);
   const modules = await getCourseModules(course.id, signal);
   
   for (let i = 0; i < modules.length; i++) {
@@ -245,19 +361,19 @@ async function collectDownloads(course, user, signal, onProgress) {
       }
     }
     
-    onProgress(0.25 + (i + 1) / modules.length * 0.25,
+    onProgress(0.35 + (i + 1) / modules.length * 0.2,
       `${courseName}: Scanned ${i + 1}/${modules.length} modules`);
   }
   
-  // === 3. ASSIGNMENTS (both professor attachments AND your submissions) ===
-  onProgress(0.5, `${courseName}: Scanning assignments...`);
+  // === 4. ASSIGNMENTS (both professor attachments AND your submissions) ===
+  onProgress(0.55, `${courseName}: Scanning assignments...`);
   const assignments = await getCourseAssignments(course.id, signal);
   
   for (let i = 0; i < assignments.length; i++) {
     const assignment = assignments[i];
     const assignmentName = sanitizeFilename(assignment.name);
     
-    // 3a. Professor's attachments TO the assignment
+    // 4a. Professor's attachments TO the assignment
     if (assignment.attachments && assignment.attachments.length > 0) {
       for (const att of assignment.attachments) {
         downloads.push({
@@ -268,7 +384,7 @@ async function collectDownloads(course, user, signal, onProgress) {
       }
     }
     
-    // 3b. Your submission attachments
+    // 4b. Your submission attachments
     const submission = await getSubmission(course.id, assignment.id, user.id, signal);
     if (submission && submission.attachments) {
       for (const att of submission.attachments) {
@@ -280,7 +396,7 @@ async function collectDownloads(course, user, signal, onProgress) {
       }
     }
     
-    onProgress(0.5 + (i + 1) / assignments.length * 0.5,
+    onProgress(0.55 + (i + 1) / assignments.length * 0.45,
       `${courseName}: Scanned ${i + 1}/${assignments.length} assignments`);
   }
   
@@ -418,8 +534,27 @@ function stopDownload() {
   }
 }
 
+async function checkDomain() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0] && tabs[0].url) {
+        resolve(tabs[0].url.startsWith('https://canvas.unl.edu'));
+      } else {
+        resolve(false);
+      }
+    });
+  });
+}
+
 async function main() {
   try {
+    // Check if we're on Canvas
+    const onCanvas = await checkDomain();
+    if (!onCanvas) {
+      setStatus('Please navigate to canvas.unl.edu to use this extension.', 'error');
+      return;
+    }
+    
     const user = await getCurrentUser();
     setStatus(`Connected as ${user.name}`, 'success');
     

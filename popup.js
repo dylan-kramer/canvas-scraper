@@ -448,11 +448,11 @@ async function startDownload(selectedCourses, user) {
       allDownloads = allDownloads.concat(downloads);
     }
     
-    // Deduplicate
+    // Deduplicate by full path (allows same file in different modules)
     const seen = new Set();
     allDownloads = allDownloads.filter(d => {
-      if (seen.has(d.url)) return false;
-      seen.add(d.url);
+      if (seen.has(d.filename)) return false;
+      seen.add(d.filename);
       return true;
     });
     

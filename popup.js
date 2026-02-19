@@ -281,26 +281,32 @@ async function collectDownloads(course, user, signal, onProgress) {
   onProgress(0.25, `${courseName}: Scanning modules...`);
   const modules = await getCourseModules(course.id, signal);
   
-  for (let i = 0; i < modules.length; i++) {
-    const mod = modules[i];
-    const moduleName = sanitizeFilename(mod.name);
-    if (!mod.items) continue;
+  // Process each module with explicit parameter passing to avoid closure issues
+  async function processModule(mod, modIndex) {
+    const thisModuleName = sanitizeFilename(mod.name);
+    const moduleDownloads = [];
     
-    for (const item of mod.items) {
+    if (!mod.items || mod.items.length === 0) {
+      return moduleDownloads;
+    }
+    
+    for (let j = 0; j < mod.items.length; j++) {
+      const item = mod.items[j];
+      
       // Handle File items directly
       if (item.type === 'File' && item.url) {
         try {
           const fileData = await apiGet(item.url.replace(API_BASE, ''), signal);
-          if (fileData.url) {
-            downloads.push({
+          if (fileData && fileData.url) {
+            moduleDownloads.push({
               url: fileData.url,
-              filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`,
+              filename: `${courseName}/Modules/${thisModuleName}/${fileData.display_name}`,
               size: fileData.size || 0
             });
           }
         } catch (e) {
           if (e.name === 'AbortError') throw e;
-          console.warn('Could not fetch module file:', e);
+          console.warn(`Could not fetch module file in ${thisModuleName}:`, e);
         }
       }
       
@@ -310,53 +316,61 @@ async function collectDownloads(course, user, signal, onProgress) {
           const pageData = await getPageContent(course.id, item.page_url, signal);
           if (pageData && pageData.body) {
             const fileIds = extractFileUrls(pageData.body, course.id);
-            for (const fileId of fileIds) {
+            for (let k = 0; k < fileIds.length; k++) {
+              const fileId = fileIds[k];
               try {
                 const fileData = await apiGet(`/files/${fileId}`, signal);
-                if (fileData.url) {
-                  downloads.push({
+                if (fileData && fileData.url) {
+                  moduleDownloads.push({
                     url: fileData.url,
-                    filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`,
+                    filename: `${courseName}/Modules/${thisModuleName}/${fileData.display_name}`,
                     size: fileData.size || 0
                   });
                 }
               } catch (e) {
                 if (e.name === 'AbortError') throw e;
-                console.warn('Could not fetch file from page:', e);
+                console.warn(`Could not fetch file ${fileId} from page in ${thisModuleName}:`, e);
               }
             }
           }
         } catch (e) {
           if (e.name === 'AbortError') throw e;
-          console.warn('Could not fetch module page:', e);
+          console.warn(`Could not fetch module page in ${thisModuleName}:`, e);
         }
       }
       
       // Handle ExternalUrl items that link to files
       if (item.type === 'ExternalUrl' && item.external_url) {
-        const url = item.external_url;
-        // Check if it's a Canvas file URL
-        const fileMatch = url.match(/\/files\/(\d+)/);
+        const extUrl = item.external_url;
+        const fileMatch = extUrl.match(/\/files\/(\d+)/);
         if (fileMatch) {
           try {
             const fileData = await apiGet(`/files/${fileMatch[1]}`, signal);
-            if (fileData.url) {
-              downloads.push({
+            if (fileData && fileData.url) {
+              moduleDownloads.push({
                 url: fileData.url,
-                filename: `${courseName}/Modules/${moduleName}/${fileData.display_name}`,
+                filename: `${courseName}/Modules/${thisModuleName}/${fileData.display_name}`,
                 size: fileData.size || 0
               });
             }
           } catch (e) {
             if (e.name === 'AbortError') throw e;
-            console.warn('Could not fetch external url file:', e);
+            console.warn(`Could not fetch external url file in ${thisModuleName}:`, e);
           }
         }
       }
     }
     
+    return moduleDownloads;
+  }
+  
+  for (let i = 0; i < modules.length; i++) {
+    const mod = modules[i];
+    const moduleFiles = await processModule(mod, i);
+    downloads.push(...moduleFiles);
+    
     onProgress(0.25 + (i + 1) / modules.length * 0.3,
-      `${courseName}: Scanned ${i + 1}/${modules.length} modules`);
+      `${courseName}: Scanned ${i + 1}/${modules.length} modules (${mod.name})`);
   }
   
   // === 3. ASSIGNMENTS (both professor attachments AND your submissions) ===

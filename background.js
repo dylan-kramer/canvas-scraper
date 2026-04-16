@@ -3,8 +3,16 @@
 // Import JSZip at top level (required for MV3 service workers)
 importScripts('jszip.min.js');
 
-const CANVAS_BASE = 'https://canvas.unl.edu';
-const API_BASE = `${CANVAS_BASE}/api/v1`;
+let CANVAS_BASE = 'https://canvas.unl.edu';
+let API_BASE = `${CANVAS_BASE}/api/v1`;
+let currentSignal = null;
+
+function setCanvasBase(baseUrl) {
+  if (baseUrl) {
+    CANVAS_BASE = baseUrl;
+    API_BASE = `${CANVAS_BASE}/api/v1`;
+  }
+}
 const CONCURRENT_DOWNLOADS = 4;
 
 let downloadState = {
@@ -228,6 +236,46 @@ async function collectDiscussions(courseId, courseName, signal) {
   return downloads;
 }
 
+// NEW: Collect syllabus
+async function collectSyllabus(courseId, courseName, signal) {
+  const downloads = [];
+  
+  try {
+    const syllabus = await apiGet(`/courses/${courseId}`, signal);
+    if (syllabus && syllabus.syllabus_body) {
+      const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Syllabus</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+    h1 { color: #333; }
+    .meta { color: #666; font-size: 14px; margin-bottom: 20px; }
+    .content { line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>${syllabus.name || 'Course Syllabus'}</h1>
+  <div class="meta">Term: ${syllabus.term ? syllabus.term.name : 'N/A'}</div>
+  <div class="content">${syllabus.syllabus_body || ''}</div>
+</body>
+</html>`;
+      
+      downloads.push({
+        content: htmlContent,
+        filename: `${courseName}/Syllabus.html`,
+        size: htmlContent.length,
+        isText: true
+      });
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+  }
+  
+  return downloads;
+}
+
 // NEW: Collect announcements (as HTML files + attachments)
 async function collectAnnouncements(courseId, courseName, signal) {
   const downloads = [];
@@ -375,8 +423,13 @@ async function collectDownloads(course, user, signal, onProgress) {
     if (e.name === 'AbortError') throw e;
   }
   
+  // Syllabus
+  onProgress(0.65, `${courseName}: Scanning syllabus...`);
+  const syllabusDownloads = await collectSyllabus(course.id, courseName, signal);
+  downloads.push(...syllabusDownloads);
+
   // NEW: Discussions
-  onProgress(0.65, `${courseName}: Scanning discussions...`);
+  onProgress(0.7, `${courseName}: Scanning discussions...`);
   const discussionDownloads = await collectDiscussions(course.id, courseName, signal);
   downloads.push(...discussionDownloads);
   
@@ -396,11 +449,12 @@ async function fetchFileAsBlob(url, signal) {
   return await response.blob();
 }
 
-// NEW: Concurrent download pool
+// NEW: Concurrent download pool with retry
 async function downloadWithConcurrency(downloads, zip, signal, onProgress) {
   let completed = 0;
   let failed = 0;
   const total = downloads.length;
+  const MAX_RETRIES = 3;
   
   // Create a queue of work
   const queue = [...downloads];
@@ -414,19 +468,26 @@ async function downloadWithConcurrency(downloads, zip, signal, onProgress) {
       if (!dl) break;
       
       const shortName = dl.filename.split('/').pop();
+      let success = false;
+      let retries = 0;
       
-      try {
-        if (dl.isText) {
-          // Text content (like announcements HTML)
-          zip.file(dl.filename, dl.content);
-        } else {
-          // File download
-          const blob = await fetchFileAsBlob(dl.url, signal);
-          zip.file(dl.filename, blob);
+      while (!success && retries < MAX_RETRIES) {
+        try {
+          if (dl.isText) {
+            zip.file(dl.filename, dl.content);
+            success = true;
+          } else {
+            const blob = await fetchFileAsBlob(dl.url, signal);
+            zip.file(dl.filename, blob);
+            success = true;
+          }
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          retries++;
+          if (retries >= MAX_RETRIES) {
+            failed++;
+          }
         }
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        failed++;
       }
       
       completed++;
@@ -632,12 +693,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (message.action === 'scan') {
+    setCanvasBase(message.canvasBase);
     scanOnly(message.courses, message.user);
     sendResponse({ ok: true });
     return true;
   }
   
   if (message.action === 'confirmDownload') {
+    setCanvasBase(message.canvasBase);
     confirmDownload(message.courses);
     sendResponse({ ok: true });
     return true;

@@ -1,7 +1,7 @@
 // Popup UI - communicates with background worker
 
-const CANVAS_BASE = 'https://canvas.unl.edu';
-const API_BASE = `${CANVAS_BASE}/api/v1`;
+let CANVAS_BASE = 'https://canvas.unl.edu';
+let API_BASE = `${CANVAS_BASE}/api/v1`;
 
 let currentUser = null;
 let courses = [];
@@ -107,7 +107,16 @@ async function checkDomain() {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0] && tabs[0].url) {
-        resolve(tabs[0].url.startsWith('https://canvas.unl.edu'));
+        const url = tabs[0].url;
+        // Match any Canvas LMS instance (e.g., canvas.unl.edu, canvas.example.edu)
+        const match = url.match(/^(https?:\/\/[^\/]+)/);
+        if (match) {
+          CANVAS_BASE = match[1];
+          API_BASE = `${CANVAS_BASE}/api/v1`;
+          resolve(true);
+        } else {
+          resolve(false);
+        }
       } else {
         resolve(false);
       }
@@ -137,14 +146,16 @@ function startScan() {
   chrome.runtime.sendMessage({
     action: 'scan',
     courses: selectedCourses,
-    user: currentUser
+    user: currentUser,
+    canvasBase: CANVAS_BASE
   });
 }
 
 function confirmDownload() {
   chrome.runtime.sendMessage({
     action: 'confirmDownload',
-    courses: selectedCourses
+    courses: selectedCourses,
+    canvasBase: CANVAS_BASE
   });
 }
 
@@ -164,7 +175,7 @@ async function main() {
     // Check domain
     const onCanvas = await checkDomain();
     if (!onCanvas) {
-      setStatus('Please navigate to canvas.unl.edu to use this extension.', 'error');
+      setStatus('Please navigate to your Canvas LMS instance to use this extension.', 'error');
       return;
     }
     

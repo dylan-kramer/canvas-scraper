@@ -2,14 +2,15 @@
   "manifest_version": 3,
   "name": "Canvas Scraper",
   "version": "0.2.9",
-  "description": "Download all Canvas LMS files, modules, and submissions for archival",
+  "description": "Download and archive all files from any Canvas LMS instance",
   "permissions": [
     "downloads",
     "storage",
     "tabs"
   ],
   "host_permissions": [
-    "https://canvas.unl.edu/*"
+    "https://*/*",
+    "http://*/*"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -28,7 +29,7 @@
     "128": "icons/icon128.png"
   },
   "content_scripts": [{
-    "matches": ["https://canvas.unl.edu/*"],
+    "matches": ["https://*/*", "http://*/*"],
     "js": ["content.js"],
     "run_at": "document_idle"
   }]

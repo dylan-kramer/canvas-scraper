@@ -276,6 +276,73 @@ async function collectSyllabus(courseId, courseName, signal) {
   return downloads;
 }
 
+// NEW: Collect all Pages (not just module-linked ones)
+async function collectPages(courseId, courseName, signal) {
+  const downloads = [];
+  
+  try {
+    const pages = await apiGetAll(`/courses/${courseId}/pages?per_page=100`, signal);
+    
+    for (const page of pages) {
+      const pageTitle = sanitizeFilename(page.title || 'Untitled');
+      
+      try {
+        const pageData = await apiGet(`/courses/${courseId}/pages/${page.url}`, signal);
+        
+        if (pageData && pageData.body) {
+          const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>${page.title || 'Page'}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+    h1 { color: #333; }
+    .meta { color: #666; font-size: 14px; margin-bottom: 20px; }
+    .content { line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>${page.title || 'Page'}</h1>
+  <div class="meta">Last updated: ${page.updated_at || 'Unknown'}</div>
+  <div class="content">${pageData.body || ''}</div>
+</body>
+</html>`;
+          
+          downloads.push({
+            content: htmlContent,
+            filename: `${courseName}/Pages/${pageTitle}.html`,
+            size: htmlContent.length,
+            isText: true
+          });
+          
+          const fileIds = extractFileUrls(pageData.body);
+          for (const fileId of fileIds) {
+            try {
+              const fileData = await apiGet(`/files/${fileId}`, signal);
+              if (fileData && fileData.url) {
+                downloads.push({
+                  url: fileData.url,
+                  filename: `${courseName}/Pages/${pageTitle}/${fileData.display_name}`,
+                  size: fileData.size || 0
+                });
+              }
+            } catch (e) {
+              if (e.name === 'AbortError') throw e;
+            }
+          }
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+  }
+  
+  return downloads;
+}
+
 // NEW: Collect announcements (as HTML files + attachments)
 async function collectAnnouncements(courseId, courseName, signal) {
   const downloads = [];
@@ -423,18 +490,23 @@ async function collectDownloads(course, user, signal, onProgress) {
     if (e.name === 'AbortError') throw e;
   }
   
+  // Pages (for courses that use Pages instead of Modules/Files)
+  onProgress(0.6, `${courseName}: Scanning pages...`);
+  const pageDownloads = await collectPages(course.id, courseName, signal);
+  downloads.push(...pageDownloads);
+
   // Syllabus
   onProgress(0.65, `${courseName}: Scanning syllabus...`);
   const syllabusDownloads = await collectSyllabus(course.id, courseName, signal);
   downloads.push(...syllabusDownloads);
 
   // NEW: Discussions
-  onProgress(0.7, `${courseName}: Scanning discussions...`);
+  onProgress(0.75, `${courseName}: Scanning discussions...`);
   const discussionDownloads = await collectDiscussions(course.id, courseName, signal);
   downloads.push(...discussionDownloads);
   
   // NEW: Announcements
-  onProgress(0.8, `${courseName}: Scanning announcements...`);
+  onProgress(0.85, `${courseName}: Scanning announcements...`);
   const announcementDownloads = await collectAnnouncements(course.id, courseName, signal);
   downloads.push(...announcementDownloads);
   

@@ -6,6 +6,7 @@ A Chrome extension to download and archive files from any Canvas LMS instance.
 
 - Downloads files from the Files section (preserving folder structure)
 - Downloads module content and attachments
+- Downloads Pages (for courses using Pages instead of Modules)
 - Downloads assignment submission attachments
 - Downloads discussion topic and entry attachments
 - Downloads announcements (saved as HTML)
